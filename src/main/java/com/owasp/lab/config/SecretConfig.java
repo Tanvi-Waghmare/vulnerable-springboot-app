@@ -1,8 +1,7 @@
 package com.owasp.lab.config;
 
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
 
 /**
  * REMEDIATION (OWASP A02:2021 - Cryptographic Failures /
@@ -19,6 +18,12 @@ import org.springframework.beans.factory.annotation.Value;
  *  - VULN-013: the JWT signing key, when one is required, must be a
  *    high-entropy value generated via SecureRandom and rotated
  *    periodically.
+ *  - VULN-015: secrets are NO LONGER exposed as named {@code String}
+ *    beans in the application context.  Exposing them as beans would
+ *    allow any autowired {@code String} matched by name anywhere in
+ *    the application to silently receive them.  Consumers that need a
+ *    specific secret should {@code @Value}-inject it directly inside
+ *    their own bean.
  */
 @Configuration
 public class SecretConfig {
@@ -32,18 +37,15 @@ public class SecretConfig {
     @Value("${app.secret.jwt.signing.key:}")
     private String jwtSigningKey;
 
-    @Bean(name = "apiKey")
-    public String apiKey() {
+    public String getApiKey() {
         return apiKey;
     }
 
-    @Bean(name = "dbPassword")
-    public String dbPassword() {
+    public String getDbPassword() {
         return dbPassword;
     }
 
-    @Bean(name = "jwtSigningKey")
-    public String jwtSigningKey() {
+    public String getJwtSigningKey() {
         return jwtSigningKey;
     }
 }

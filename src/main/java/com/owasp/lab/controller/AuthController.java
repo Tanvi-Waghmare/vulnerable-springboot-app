@@ -2,12 +2,20 @@ package com.owasp.lab.controller;
 
 import com.owasp.lab.model.User;
 import com.owasp.lab.service.UserService;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
 
 import java.util.Map;
 
@@ -28,6 +36,7 @@ import java.util.Map;
  */
 @RestController
 @RequestMapping("/api")
+@Validated
 public class AuthController {
 
     private final UserService userService;
@@ -62,25 +71,27 @@ public class AuthController {
     }
 
     @PostMapping("/register")
-    public ResponseEntity<User> register(@RequestBody Map<String, String> body) {
-        String username = body.getOrDefault("username", "");
-        String password = body.getOrDefault("password", "");
-        String email    = body.getOrDefault("email", "");
-
+    public ResponseEntity<User> register(@Valid @RequestBody RegistrationRequest body) {
         // REMEDIATION (A01:2021 / A04:2021): the role is ALWAYS forced
         // to USER server-side.  Even if the caller supplies a role
         // field, it is ignored - ADMIN elevation must go through an
         // authenticated, audited admin-only endpoint.
-        User u = new User(username, passwordEncoder.encode(password), email, "USER", 0.0);
-        return ResponseEntity.ok(userService.save(u));
+        // REMEDIATION (A04:2021): input is bound to a typed DTO with
+        // Bean Validation constraints so oversized / malformed input
+        // is rejected before it reaches the database.
+        User u = new User(body.getUsername(),
+                passwordEncoder.encode(body.getPassword()),
+                body.getEmail(), "USER", 0.0);
+        User saved = userService.save(u);
+        return ResponseEntity.ok(saved);
     }
 
     @PostMapping("/transfer")
-    public ResponseEntity<?> transfer(@RequestBody Map<String, Object> body,
+    public ResponseEntity<?> transfer(@Valid @RequestBody TransferRequest body,
                                        @AuthenticationPrincipal UserDetails caller) {
-        Long fromId = ((Number) body.get("fromId")).longValue();
-        Long toId   = ((Number) body.get("toId")).longValue();
-        Double amount = ((Number) body.get("amount")).doubleValue();
+        Long fromId = body.getFromId();
+        Long toId   = body.getToId();
+        Double amount = body.getAmount();
 
         // REMEDIATION (A01:2021 - IDOR): the caller must own the
         // source account unless they are an ADMIN.
@@ -117,5 +128,65 @@ public class AuthController {
                 "fromBalance", from.getBalance(),
                 "toBalance", to.getBalance()
         ));
+    }
+
+    /**
+     * Typed payload for /api/register.
+     *
+     * REMEDIATION (A04:2021 - Insecure Design): bean-validation
+     * constraints reject empty / oversized / malformed input BEFORE
+     * the controller body executes, eliminating the unbounded-input
+     * sink from the original {@code Map<String,String>} binding.
+     */
+    public static class RegistrationRequest {
+        @NotBlank
+        @Size(min = 3, max = 64)
+        private String username;
+
+        @NotBlank
+        @Size(min = 8, max = 128)
+        private String password;
+
+        @Email
+        @Size(max = 254)
+        private String email;
+
+        public String getUsername() { return username; }
+        public void setUsername(String username) { this.username = username; }
+
+        public String getPassword() { return password; }
+        public void setPassword(String password) { this.password = password; }
+
+        public String getEmail() { return email; }
+        public void setEmail(String email) { this.email = email; }
+    }
+
+    /**
+     * Typed payload for /api/transfer.
+     *
+     * REMEDIATION (A04:2021 - Insecure Design): @NotNull / @Positive
+     * reject negative or missing amounts BEFORE the controller
+     * executes.  The original untyped Map allowed callers to send
+     * {@code {"amount": -1e308}}.
+     */
+    public static class TransferRequest {
+        @NotNull
+        private Long fromId;
+
+        @NotNull
+        private Long toId;
+
+        @NotNull
+        @Positive
+        private Double amount;
+
+        public Long getFromId() { return fromId; }
+        public void setFromId(Long fromId) { this.fromId = fromId; }
+
+        public Long getToId() { return toId; }
+        public void setToId(Long toId) { this.toId = toId; }
+
+        public Double getAmount() { return amount; }
+        public void setAmount(Double amount) { this.amount = amount; }
     }
 }

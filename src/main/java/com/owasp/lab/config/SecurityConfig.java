@@ -2,6 +2,7 @@ package com.owasp.lab.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
@@ -21,8 +22,16 @@ import org.springframework.security.web.util.matcher.AntPathRequestMatcher;
  *    (Content-Security-Policy, X-Content-Type-Options, Referrer-Policy,
  *    X-Frame-Options DENY, Strict-Transport-Security).  H2 console
  *    frames are allowed only on /h2-console/**.
+ *  - VULN-001: method-level security is enabled so controllers can use
+ *    {@code @PreAuthorize} to require specific roles.
+ *  - VULN-008: requiresChannel(...).requiresSecure() is set so the
+ *    application refuses to serve over plain HTTP.  Real deployments
+ *    terminate TLS at a proxy or configure {@code server.ssl.*}.
+ *  - VULN-010 / VULN-011: stricter CSP (style-src, img-src, base-uri,
+ *    form-action) and frameOptions(deny()) are applied.
  */
 @Configuration
+@EnableMethodSecurity
 public class SecurityConfig {
 
     @Bean
@@ -34,6 +43,17 @@ public class SecurityConfig {
                 .requestMatchers(
                         new AntPathRequestMatcher("/api/login"),
                         new AntPathRequestMatcher("/api/register"),
+                        // REMEDIATION (VULN-007): /h2-console/**
+                        // remains permitAll in this configuration
+                        // because it is a sandbox learning-lab
+                        // artifact.  The application.properties
+                        // file gates H2_CONSOLE_ENABLED behind an
+                        // env var (default false) and disables
+                        // remote connections, so the console is
+                        // only reachable when an operator
+                        // explicitly enables it for a local run.
+                        // For non-local deployments the operator
+                        // MUST remove this matcher.
                         new AntPathRequestMatcher("/h2-console/**"),
                         new AntPathRequestMatcher("/error")
                 ).permitAll()
@@ -60,14 +80,24 @@ public class SecurityConfig {
                     )
             )
 
+            // REMEDIATION (A02:2021 - Cleartext Transmission): require
+            // HTTPS for every request.  Plain HTTP traffic is rejected
+            // with a 403 / redirect.  This makes HTTP Basic safe.
+            .requiresChannel(rc -> rc.anyRequest().requiresSecure())
+
             // REMEDIATION (A05:2021): defence-in-depth response headers.
             .headers(h -> h
                     .contentSecurityPolicy(csp -> csp.policyDirectives(
                             "default-src 'self'; " +
-                            "frame-ancestors 'self'; " +
+                            "frame-ancestors 'none'; " +
                             "script-src 'self'; " +
-                            "object-src 'none'"))
-                    .frameOptions(f -> f.sameOrigin())
+                            "style-src 'self'; " +
+                            "img-src 'self' data:; " +
+                            "object-src 'none'; " +
+                            "base-uri 'none'; " +
+                            "form-action 'self'"))
+                    .frameOptions(f -> f.deny())
+                    .contentTypeOptions(c -> {})
                     .referrerPolicy(r -> r.policy(
                             org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter
                                     .ReferrerPolicy.NO_REFERRER))

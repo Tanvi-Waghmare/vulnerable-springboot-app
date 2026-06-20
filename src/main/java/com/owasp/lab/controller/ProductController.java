@@ -2,13 +2,21 @@ package com.owasp.lab.controller;
 
 import com.owasp.lab.model.Product;
 import com.owasp.lab.service.ProductService;
+import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 
 /**
- * Simple product endpoints used as additional demo targets.
+ * Product endpoints.
+ *
+ * REMEDIATION (OWASP A01:2021 - Broken Access Control):
+ *  - POST /api/products is now restricted to ADMIN via @PreAuthorize.
+ *    Non-admins (including anonymous callers) receive a 403 / AccessDenied.
+ *  - The inbound payload is validated via @Valid + jakarta.validation
+ *    constraints declared on the Product model.
  */
 @RestController
 @RequestMapping("/api/products")
@@ -25,10 +33,9 @@ public class ProductController {
         return productService.findAll();
     }
 
-    // VULNERABILITY (OWASP A01:2021 - Broken Access Control):
-    // Anyone may create products without authentication.
     @PostMapping
-    public ResponseEntity<Product> create(@RequestBody Product p) {
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<Product> create(@Valid @RequestBody Product p) {
         return ResponseEntity.ok(productService.save(p));
     }
 }

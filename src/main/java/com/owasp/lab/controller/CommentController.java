@@ -2,8 +2,12 @@ package com.owasp.lab.controller;
 
 import com.owasp.lab.model.Comment;
 import com.owasp.lab.service.CommentService;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.util.HtmlUtils;
 
@@ -21,6 +25,7 @@ import java.util.List;
  */
 @RestController
 @RequestMapping("/api/comment")
+@Validated
 public class CommentController {
 
     private final CommentService commentService;
@@ -30,7 +35,7 @@ public class CommentController {
     }
 
     @PostMapping
-    public Comment create(@RequestBody Comment c) {
+    public Comment create(@Valid @RequestBody Comment c) {
         return commentService.save(c);
     }
 
@@ -40,7 +45,9 @@ public class CommentController {
     }
 
     @GetMapping(value = "/greet", produces = MediaType.TEXT_HTML_VALUE)
-    public String greet(@RequestParam(value = "name", defaultValue = "World") String name) {
+    public String greet(
+            @RequestParam(value = "name", defaultValue = "World")
+            @NotBlank @Size(max = 64) String name) {
         // REMEDIATION (A03:2021 - XSS): HTML-escape the user-controlled
         // value before concatenating it into the response.
         String safe = HtmlUtils.htmlEscape(name);

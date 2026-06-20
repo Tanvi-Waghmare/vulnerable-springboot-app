@@ -1,9 +1,16 @@
 package com.owasp.lab.model;
 
 import jakarta.persistence.*;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 
 /**
  * Comment entity used by the XSS demo endpoint.
+ *
+ * REMEDIATION (OWASP A03:2021 - Injection / XSS):
+ * Input length is capped via Bean Validation.  Defence-in-depth: stored
+ * comments are still HTML-escaped on the read path by
+ * {@link com.owasp.lab.controller.CommentViewController}.
  */
 @Entity
 @Table(name = "comments")
@@ -13,12 +20,13 @@ public class Comment {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @NotBlank
+    @Size(max = 100)
     private String author;
 
-    // VULNERABILITY (A03:2021 - Injection / XSS):
-    // Body is stored raw; the controller will echo it back into HTML
-    // WITHOUT escaping. This is the XSS sink.
     @Column(length = 2000)
+    @NotBlank
+    @Size(max = 2000)
     private String body;
 
     public Comment() {}

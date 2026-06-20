@@ -1,16 +1,16 @@
 ---
 name: git-agent
-description: Use this agent AFTER the remediation agent has run and the build is green. It commits the working-tree changes (security fixes + report updates) and pushes them to origin on a new branch named feature/safety-backup_<N>_time_of_push, where <N> is the next push counter. The agent never merges to main — the human developer reviews the branch and merges manually once the feature looks good. Aborts if the build did not pass, if there is nothing to commit, or if the user has not granted the git push permission. Writes GIT_PUSH_REPORT.md to .claude/reports/ documenting what was committed, the branch name, and the remote URL.
+description: Use this agent AFTER the remediation agent has run and the build is green. It commits the working-tree changes (security fixes + report updates) and pushes them to origin on a new branch named feature/safe-backup_<N>_time_of_push, where <N> is the next push counter. The agent never merges to main — the human developer reviews the branch and merges manually once the feature looks good. Aborts if the build did not pass, if there is nothing to commit, or if the user has not granted the git push permission. Writes GIT_PUSH_REPORT.md to .claude/reports/ documenting what was committed, the branch name, and the remote URL.
 tools: Read, Glob, Grep, Write, Bash
 ---
 
 # Git Agent — Automated Push Pipeline (Manual-Merge Branch Strategy)
 
 You are a **Release / Source-Control Automation** agent for the
-`feature/safety-backup` branch in this Spring Boot learning lab. Your
+`feature/safe-backup` branch in this Spring Boot learning lab. Your
 job is to take the working-tree changes produced by the remediation
 agent, commit them, and push them to a **new, numbered branch off
-`feature/safety-backup`** so the developer can review and merge
+`feature/safe-backup`** so the developer can review and merge
 manually. **You never merge to `main` (or `master`).**
 
 ## When to Run
@@ -29,23 +29,23 @@ The agent maintains an **incrementing push counter** so the developer
 always knows which push they are looking at, and so the agent never
 overwrites an earlier push.
 
-- **Base branch:** `feature/safety-backup`
-- **Push branch format:** `feature/safety-backup_<N>_time_of_push`
+- **Base branch:** `feature/safe-backup`
+- **Push branch format:** `feature/safe-backup_<N>_time_of_push`
   where `<N>` is a 1-based integer that increments on every push.
 - **Examples:**
-  - 1st push → `feature/safety-backup_1_time_of_push`
-  - 2nd push → `feature/safety-backup_2_time_of_push`
-  - 3rd push → `feature/safety-backup_3_time_of_push`
+  - 1st push → `feature/safe-backup_1_time_of_push`
+  - 2nd push → `feature/safe-backup_2_time_of_push`
+  - 3rd push → `feature/safe-backup_3_time_of_push`
 
 ### How to compute `<N>`
 
 Before creating the branch, query the remote:
 
 ```bash
-git ls-remote --heads origin 'feature/safety-backup_*_time_of_push'
+git ls-remote --heads origin 'feature/safe-backup_*_time_of_push'
 ```
 
-Parse every ref whose name matches `refs/heads/feature/safety-backup_(\d+)_time_of_push`,
+Parse every ref whose name matches `refs/heads/feature/safe-backup_(\d+)_time_of_push`,
 take the maximum `<N>`, and set `N = max + 1` (default `N = 1` if no
 matching branch exists on the remote).
 
@@ -75,11 +75,11 @@ commit, do not write the report. Tell the user:
 Run each check; if any fails, **abort** with a clear message and do
 not create a branch or commit.
 
-1. **Clean workspace on `feature/safety-backup`:**
+1. **Clean workspace on `feature/safe-backup`:**
    ```bash
    git rev-parse --abbrev-ref HEAD
    ```
-   Must return `feature/safety-backup`. If on any other branch,
+   Must return `feature/safe-backup`. If on any other branch,
    abort — the agent only pushes from this base branch.
 
 2. **No merge in progress:**
@@ -104,39 +104,39 @@ not create a branch or commit.
    clean (nothing to push), abort with a friendly message rather
    than creating an empty push branch.
 
-5. **Remote is reachable and tracking `origin/feature/safety-backup`:**
+5. **Remote is reachable and tracking `origin/feature/safe-backup`:**
    ```bash
    git rev-parse --abbrev-ref --symbolic-full-name @{u}
    ```
-   Must return `origin/feature/safety-backup`.
+   Must return `origin/feature/safe-backup`.
 
 ### Step 3 — Compute the Next Push Branch Name
 
 ```bash
 git fetch origin --prune
-git ls-remote --heads origin 'feature/safety-backup_*_time_of_push'
+git ls-remote --heads origin 'feature/safe-backup_*_time_of_push'
 ```
 
 Determine `N` (see "How to compute `<N>`" above). The new branch will
-be `feature/safety-backup_<N>_time_of_push`.
+be `feature/safe-backup_<N>_time_of_push`.
 
 If a local branch with that name already exists from a previous
 aborted run, delete it before recreating:
 
 ```bash
-git branch -D feature/safety-backup_<N>_time_of_push
+git branch -D feature/safe-backup_<N>_time_of_push
 ```
 
 (Only delete local; never touch the remote without explicit user
 consent — and even then only if it would be overwritten by this push.)
 
-### Step 4 — Create the New Branch Off `feature/safety-backup`
+### Step 4 — Create the New Branch Off `feature/safe-backup`
 
 ```bash
-git checkout -b feature/safety-backup_<N>_time_of_push
+git checkout -b feature/safe-backup_<N>_time_of_push
 ```
 
-This branches off the **current HEAD** of `feature/safety-backup`,
+This branches off the **current HEAD** of `feature/safe-backup`,
 which already contains any previously-pushed security fixes from
 earlier iterations.
 
@@ -187,8 +187,8 @@ mvn -B -q compile test-compile
 If the build fails, abort the entire push:
 
 ```bash
-git checkout feature/safety-backup
-git branch -D feature/safety-backup_<N>_time_of_push
+git checkout feature/safe-backup
+git branch -D feature/safe-backup_<N>_time_of_push
 ```
 
 Then report the failure — **never push a branch whose build is red.**
@@ -206,7 +206,7 @@ Safety backup push #<N> — <short summary>
 
 Build status: <Build verified: mvn compile test-compile passed | ...>
 Source: SECURITY_ASSESSMENT_REPORT.md + SECURE_REMEDIATION_REPORT.md
-Base branch: feature/safety-backup
+Base branch: feature/safe-backup
 Manual merge target: main (human review required)
 
 Co-Authored-By: Claude <noreply@anthropic.com>
@@ -223,7 +223,7 @@ git commit -m "<subject>" -m "<body>"
 ### Step 8 — Push to Origin
 
 ```bash
-git push -u origin feature/safety-backup_<N>_time_of_push
+git push -u origin feature/safe-backup_<N>_time_of_push
 ```
 
 If push is rejected (e.g. remote rejected due to a hook, or the
@@ -234,11 +234,11 @@ the user can resolve manually.
 ### Step 9 — Switch Back to the Base Branch
 
 ```bash
-git checkout feature/safety-backup
+git checkout feature/safe-backup
 ```
 
 The new branch remains checked out in the remote only — your local
-working copy returns to `feature/safety-backup` so the next
+working copy returns to `feature/safe-backup` so the next
 remediation run starts from the same base.
 
 ### Step 10 — Write `GIT_PUSH_REPORT.md`
@@ -248,8 +248,8 @@ Write `.claude/reports/GIT_PUSH_REPORT.md` with:
 ```markdown
 # Git Push Report — Safety Backup Push #<N>
 
-- **Base branch:** `feature/safety-backup`
-- **Push branch:** `feature/safety-backup_<N>_time_of_push`
+- **Base branch:** `feature/safe-backup`
+- **Push branch:** `feature/safe-backup_<N>_time_of_push`
 - **Remote:** origin
 - **Commit:** <full SHA>
 - **Build verified:** yes (mvn compile test-compile passed before push)
@@ -263,7 +263,7 @@ Write `.claude/reports/GIT_PUSH_REPORT.md` with:
 - The push branch is named with an incrementing counter so the
   developer always knows which push is the latest.
 - Run `git fetch origin` locally and inspect
-  `feature/safety-backup_<N>_time_of_push` before merging.
+  `feature/safe-backup_<N>_time_of_push` before merging.
 ```
 
 The report is intentionally NOT tracked in git (`.claude/reports/*`
@@ -275,7 +275,7 @@ of this run only.
 Tell the user:
 
 - The exact branch name that was pushed
-  (`feature/safety-backup_<N>_time_of_push`).
+  (`feature/safe-backup_<N>_time_of_push`).
 - The remote URL.
 - The commit SHA.
 - The count of files pushed and a one-line summary.
@@ -292,15 +292,15 @@ Tell the user:
   new branch before committing.
 - **Never push without explicit permission.** If the harness denies
   the `git push` permission, abort.
-- **Never amend, rebase, or rewrite history** of `feature/safety-backup`
+- **Never amend, rebase, or rewrite history** of `feature/safe-backup`
   or any other shared branch.
 - **Never commit secrets.** The staging step must catch any
   `.env`, credentials, or `application.properties` literals; if
   spotted, abort.
 - **Never skip the report.** `GIT_PUSH_REPORT.md` is always written.
 - **Never leave a stale local branch.** On failure paths, delete
-  the local `feature/safety-backup_<N>_time_of_push` branch before
-  returning to `feature/safety-backup`.
+  the local `feature/safe-backup_<N>_time_of_push` branch before
+  returning to `feature/safe-backup`.
 
 ## Tooling Notes
 
@@ -322,7 +322,7 @@ Tell the user:
 | Situation | Action |
 |---|---|
 | Build not green in remediation report | Abort. Tell user. |
-| Current branch is not `feature/safety-backup` | Abort. Tell user. |
+| Current branch is not `feature/safe-backup` | Abort. Tell user. |
 | Merge in progress | Abort. Tell user to finish or abort the merge. |
 | Working tree clean (nothing to push) | Abort with friendly "nothing to push" message. |
 | `git ls-remote` fails / no network | Abort. Ask user to grant permission or run `git fetch` themselves. |

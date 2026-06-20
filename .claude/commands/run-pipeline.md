@@ -5,22 +5,35 @@ description: Run the local security pipeline — vulnerability scan followed by 
 # /run-pipeline — Local Security Pipeline
 
 Run the full local security pipeline against the current Spring Boot
-workspace, **entirely on this machine** — no git, no CI, no remote. The
-user is testing the workflow locally.
+workspace, **entirely on this machine** — no CI, no remote. The user
+is testing the workflow locally.
 
 ## Goal
 
-Produce two files in `.claude/reports/`:
+Produce three files in `.claude/reports/`:
 
 1. `SECURITY_ASSESSMENT_REPORT.md` — written by the `vulnerability-scanner` agent.
 2. `SECURE_REMEDIATION_REPORT.md` — written by the `remediation-agent` agent.
+3. `GIT_PUSH_REPORT.md` — written by the `git-agent` agent (Step 3
+   below). The two security reports are tracked in git; the push
+   report is local-only.
 
-The scanner runs first; the remediation agent runs **only if the scanner
-succeeds**. The scanner does not modify any source files. The
+The pipeline runs in three stages — **scan → remediate → push** —
+each driven by a dedicated subagent. Once the user invokes
+`/run-pipeline`, **no further manual action is required** until the
+human developer reviews the pushed branch and merges to `main` (the
+one and only manual step in the workflow). The user does not run
+`git add`, `git commit`, or `git push` themselves at any point.
+
+The scanner runs first; the remediation agent runs **only if the
+scanner succeeds**; the git-agent runs **only if the remediation
+build is green**. The scanner does not modify any source files. The
 remediation agent **does** modify source files (applying the secure
-replacements) but never commits — its edits stay in the working tree
-for human review via `git diff`. **Both report files are overwritten on
-every run** — never merged, appended, or preserved.
+replacements) but never commits. The git-agent commits and pushes
+to a new numbered branch off `feature/safe-backup` — it **never
+merges to `main`**. The developer's manual merge step is the only
+human action that touches `main`. **The three report files are
+overwritten on every run** — never merged, appended, or preserved.
 
 ## Required Setup
 
@@ -29,6 +42,7 @@ Before launching, verify these paths exist (use `Bash` with `ls` or
 
 - `.claude/agents/vulnerability-scanner.md`
 - `.claude/agents/remediation-agent.md`
+- `.claude/agents/git-agent.md`
 - `.claude/reports/` (create it with `mkdir -p` if missing)
 
 If any required agent file is missing, stop and tell the user which one.
@@ -159,12 +173,122 @@ Pass this exact prompt to the subagent:
 
 Wait for the subagent to finish. Then verify both files exist.
 
-## Step 3 — Report Results
+## Step 3 — Run the Git Agent (automated commit + push)
+
+Launch the `git-agent` subagent (use the `Agent` tool with
+`subagent_type: "general-purpose"` and the role from
+`.claude/agents/git-agent.md`).
+
+**Step 3 is always triggered** once Step 2 has finished — the
+pipeline does not pause to ask the user for permission to commit
+or push. The git-agent's internal pre-flight (in
+`.claude/agents/git-agent.md`) is the one place the build status
+is checked, and the git-agent runs `mvn -B -q compile test-compile`
+on the new branch itself before committing. If the build is red
+on the new branch, the git-agent aborts the push cleanly and
+reports the reason in `GIT_PUSH_REPORT.md` — the pipeline then
+surfaces that abort reason to the user in Step 4. Do **not** ask
+the user "should I push?" — just launch the subagent.
+
+If the remediation report's `# Remediation Summary` does not lead
+with `Build verified: … passed`, the git-agent's pre-flight will
+abort on the build check and report the failure — the pipeline
+does not pre-empt that decision itself. The user will see the
+abort reason in the Step 4 report and can re-run after the build
+is fixed.
+
+Pass this exact prompt to the subagent:
+
+> The remediation agent has finished and the build is green. Push
+> the working-tree changes to a new safe-backup branch.
+>
+> **Pre-flight (do not skip any of these):**
+> 1. `git rev-parse --abbrev-ref HEAD` must return
+>    `feature/safe-backup`. If on any other branch, abort.
+> 2. `test -f .git/MERGE_HEAD` must be false. If a merge is in
+>    progress, abort.
+> 3. `Read` `.claude/reports/SECURE_REMEDIATION_REPORT.md` and
+>    confirm the build status is `Build verified: mvn compile
+>    test-compile passed` (or the Gradle equivalent). If it reads
+>    `Build verified: failed — all edits reverted`, abort.
+> 4. `git status --porcelain` must be non-empty. If the working
+>    tree is already clean, abort with a friendly "nothing to
+>    push" message — no empty branch.
+> 5. `git rev-parse --abbrev-ref --symbolic-full-name @{u}` must
+>    return `origin/feature/safe-backup`. If upstream tracking
+>    is missing, abort.
+>
+> **Compute the next push branch name:**
+> ```bash
+> git fetch origin --prune
+> git ls-remote --heads origin 'feature/safe-backup_*_time_of_push'
+> ```
+> Parse the refs, take the max `<N>` from
+> `feature/safe-backup_(\d+)_time_of_push`, and set
+> `N = max + 1` (default `N = 1`). The new branch is
+> `feature/safe-backup_<N>_time_of_push`. If a local branch with
+> that name already exists from a previous aborted run, delete it:
+> `git branch -D feature/safe-backup_<N>_time_of_push`.
+>
+> **Create the branch, stage, verify, commit, push:**
+> 1. `git checkout -b feature/safe-backup_<N>_time_of_push`
+> 2. `git add -A` then
+>    `git add -f .claude/reports/SECURITY_ASSESSMENT_REPORT.md .claude/reports/SECURE_REMEDIATION_REPORT.md`
+>    (the reports are tracked in git even though the rest of
+>    `.claude/reports/` is ignored).
+> 3. `git status --short` and `git diff --cached --stat` to sanity
+>    check the staged set against the remediation report's
+>    `# Files Referenced` table. Abort if anything looks wrong.
+> 4. Re-run `mvn -B -q compile test-compile` (or Gradle
+>    equivalent) on the new branch. If it fails, delete the local
+>    branch, switch back to `feature/safe-backup`, and abort —
+>    **never push a red build.**
+> 5. `git commit -m "Safety backup push #<N> — <summary>" -m "<body>"`
+>    where the body lists the Applied findings pulled from the
+>    remediation report's `# Changes Made` section, the build
+>    status, the base branch, and the manual-merge reminder.
+> 6. `git push -u origin feature/safe-backup_<N>_time_of_push`.
+>    **Never force-push.** If the push is rejected, abort and
+>    report the exact error.
+> 7. `git checkout feature/safe-backup` so the next run starts
+>    from the same base.
+>
+> **Write `.claude/reports/GIT_PUSH_REPORT.md`** (local-only, not
+> tracked) with: base branch, push branch, remote, commit SHA, build
+> status, files pushed, manual-merge reminder.
+>
+> **Hard rules:** never merge to `main` or `master`. Never force-push.
+> Never push a red build. Never push without `git push` permission —
+> if the harness denies it, abort cleanly and tell the user the exact
+> branch name so they can run `git push -u origin <branch>`
+> themselves.
+>
+> After writing the report, confirm the file exists on disk and
+> report back: the push branch name, the remote URL, the commit
+> SHA, the count of files pushed, the build status that was
+> verified pre-push, and an explicit reminder that the agent did
+> not merge to `main` (the developer reviews and merges manually).
+
+Wait for the subagent to finish. Verify the push branch exists on
+the remote:
+
+```bash
+git ls-remote --heads origin "feature/safe-backup_${N}_time_of_push"
+```
+
+If the subagent aborted (permission denied, build broke on new
+branch, push rejected, etc.), **do not fail the pipeline** —
+surface the abort reason to the user as part of the Step 4 report.
+The scan + remediation reports are still valid output.
+
+## Step 4 — Report Results
 
 Tell the user:
 
 - Absolute path of `.claude/reports/SECURITY_ASSESSMENT_REPORT.md`
 - Absolute path of `.claude/reports/SECURE_REMEDIATION_REPORT.md`
+- Absolute path of `.claude/reports/GIT_PUSH_REPORT.md` (only if
+  Step 3 ran)
 - **Build status** from the remediation report (`Build verified:
   passed` or `Build verified: failed — all edits reverted`).
 - Top-line counts from the remediation report, with the two Skip
@@ -177,12 +301,18 @@ Tell the user:
   Remained — Due To Build Breakage` section, or *None* if empty.
   Each entry must include the compiler error and the unblock action
   the human reviewer needs to take.
-- Any items the remediation agent flagged in *Residual Risks* (so the
-  user knows what still needs human action).
-- Reminder that both report files were overwritten on this run and
-  that `.claude/reports/SECURITY_ASSESSMENT_REPORT.md` and
-  `.claude/reports/SECURE_REMEDIATION_REPORT.md` are now tracked in
-  git (the rest of `.claude/reports/` remains ignored).
+- **Push summary** (if Step 3 ran): branch name
+  (`feature/safe-backup_<N>_time_of_push`), commit SHA, file
+  count, remote URL. Or, if Step 3 aborted, the exact reason and
+  the unblock action.
+- Any items the remediation agent flagged in *Residual Risks* (so
+  the user knows what still needs human action).
+- Explicit reminder that the two security reports are tracked in
+  git; the push report is local-only.
+- **Final manual step** for the developer: review the pushed
+  branch locally (`git fetch origin && git checkout
+  feature/safe-backup_<N>_time_of_push`) and merge to `main` when
+  ready. The pipeline does not do this.
 
 ## Guardrails
 
@@ -221,6 +351,10 @@ Tell the user:
 - If either subagent fails or returns an error, stop the pipeline and
   report the exact error to the user. Do **not** continue to the next
   step.
-- Never push to git, never create a commit. After a successful run,
-  the user is expected to review changes with `git diff` before
-  committing.
+- The three report files are overwritten on every run. The git-agent
+  commits and pushes a new numbered branch off `feature/safe-backup`
+  whenever the build is green; that push is the pipeline's normal
+  outcome, not an exception. After a successful run, the user is
+  expected to review the pushed branch (`git fetch origin && git
+  checkout feature/safe-backup_<N>_time_of_push`) and merge to
+  `main` manually.

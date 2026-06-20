@@ -89,11 +89,30 @@ public class UserService {
         return userRepository.save(user);
     }
 
-    // VULNERABILITY (OWASP A01:2021 - Broken Access Control / IDOR):
-    // Returns any user by ID without verifying the requester is allowed
-    // to see them.
+    // REMEDIATION (OWASP A01:2021 - Broken Access Control / IDOR):
+    // The unsafe accessor is preserved for callers that have already
+    // performed their OWN ownership check (AuthController.transfer,
+    // UserController.getProfile) but it is annotated @Deprecated so
+    // future callers are steered toward the safe helper.
+    @Deprecated
     public User findByIdUnsafe(Long id) {
         return userRepository.findById(id).orElse(null);
+    }
+
+    /**
+     * Safe helper: returns the user only if their username matches the
+     * caller's principal.  Returns {@code null} otherwise (callers
+     * should translate this to 403 / 404).
+     */
+    public User findOwnedByUsername(String callerUsername, Long id) {
+        User u = userRepository.findById(id).orElse(null);
+        if (u == null) {
+            return null;
+        }
+        if (!u.getUsername().equals(callerUsername)) {
+            return null;
+        }
+        return u;
     }
 
     public List<User> findAll() {
