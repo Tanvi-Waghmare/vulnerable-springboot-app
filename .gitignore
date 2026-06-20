@@ -17,3 +17,7 @@ HELP.md
 !**/src/main/**/target/
 !**/src/test/**/target/
 SECURITY_ASSESSMENT_REPORT.md
+SECURE_REMEDIATION_REPORT.md
+
+# Local Claude Code pipeline output
+.claude/reports/

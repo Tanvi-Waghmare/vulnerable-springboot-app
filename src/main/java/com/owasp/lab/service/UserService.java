@@ -26,46 +26,61 @@ public class UserService {
     }
 
     // -----------------------------------------------------------------
-    // VULNERABILITY (OWASP A03:2021 - Injection: SQL Injection)
+    // REMEDIATION (OWASP A03:2021 - Injection: SQL Injection)
     //
-    // The search term is concatenated into a raw SQL query.
-    // An attacker can supply:   ' OR '1'='1
-    // and dump every user row. NEVER do this in production code.
+    // Replaced raw concatenation with a parameterised native query
+    // bound via :username.  User input is treated as a literal value
+    // by Hibernate and can never alter the SQL structure.
     // -----------------------------------------------------------------
-    @SuppressWarnings("unchecked")
-    @Transactional
+    @Transactional(readOnly = true)
     public List<User> findByUsernameUnsafe(String username) {
-        // VULNERABILITY: SQL Injection example - user input concatenated directly.
-        String sql = "SELECT * FROM users WHERE username = '" + username + "'";
-        System.out.println("[VULNERABILITY] Executing raw SQL: " + sql);
-
         try {
-            List<User> rows = entityManager
-                    .createNativeQuery(sql, User.class)
+            return entityManager
+                    .createNativeQuery(
+                            "SELECT * FROM users WHERE username = :username",
+                            User.class)
+                    .setParameter("username", username)
                     .getResultList();
-            return rows;
         } catch (Exception ex) {
+            // REMEDIATION (A09:2021): log failed lookups rather than
+            // silently swallowing exceptions.
+            org.slf4j.LoggerFactory.getLogger(UserService.class)
+                    .warn("findByUsernameUnsafe failed for input of length {}",
+                            username == null ? 0 : username.length(), ex);
             return new ArrayList<>();
         }
     }
 
     // -----------------------------------------------------------------
-    // VULNERABILITY (OWASP A07:2021 - Broken Authentication):
-    // The login endpoint compares plaintext passwords using String.equals.
-    // No hashing, no salting, no constant-time compare.
+    // REMEDIATION (OWASP A07:2021 - Broken Authentication):
+    // Look the user up via parameterised SQL (no concatenation), then
+    // compare the supplied password against the stored hash with a
+    // constant-time BCrypt match.  Plaintext credentials are no longer
+    // compared by the database.
     // -----------------------------------------------------------------
-    public User loginUnsafe(String username, String password) {
-        // VULNERABILITY: raw SQL with concatenated credentials.
-        String sql = "SELECT * FROM users WHERE username = '"
-                + username + "' AND password = '" + password + "'";
-        System.out.println("[VULNERABILITY] Login SQL: " + sql);
-
+    public User loginUnsafe(String username, String password,
+                            org.springframework.security.crypto.password.PasswordEncoder passwordEncoder) {
         try {
             List<User> rows = entityManager
-                    .createNativeQuery(sql, User.class)
+                    .createNativeQuery(
+                            "SELECT * FROM users WHERE username = :username",
+                            User.class)
+                    .setParameter("username", username)
                     .getResultList();
-            return rows.isEmpty() ? null : rows.get(0);
+            if (rows.isEmpty()) {
+                return null;
+            }
+            User candidate = rows.get(0);
+            // Constant-time hash comparison; matches() also handles the
+            // {bcrypt} prefix used by DelegatingPasswordEncoder.
+            if (passwordEncoder.matches(password, candidate.getPassword())) {
+                return candidate;
+            }
+            return null;
         } catch (Exception ex) {
+            org.slf4j.LoggerFactory.getLogger(UserService.class)
+                    .warn("loginUnsafe failed for username of length {}",
+                            username == null ? 0 : username.length(), ex);
             return null;
         }
     }
