@@ -47,6 +47,16 @@
             <artifactId>spring-boot-starter-security</artifactId>
         </dependency>
 
+        <!-- Server-rendered HTML UI -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-thymeleaf</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.thymeleaf.extras</groupId>
+            <artifactId>thymeleaf-extras-springsecurity6</artifactId>
+        </dependency>
+
         <!-- H2 in-memory database -->
         <dependency>
             <groupId>com.h2database</groupId>
