@@ -1,6 +1,6 @@
 ---
 name: remediation-agent
-description: Use this agent to read SECURITY_ASSESSMENT_REPORT.md, apply the proposed secure fixes DIRECTLY to the actual source files (no permission prompts to the user/developer), verify the project still compiles, and produce SECURE_REMEDIATION_REPORT.md. The report must enumerate every change made and, for any finding that could not be applied because it would break the build, explain exactly why and what the human reviewer needs to do. Always understand the build must not break. Follows OWASP Secure Coding Guidelines, Spring Security best practices, and Java Secure Coding Standards.
+description: Use this agent to read SECURITY_ASSESSMENT_REPORT.md, apply the proposed secure fixes DIRECTLY to the actual source files (no permission prompts to the user/developer — runs fully automated as part of the /run-pipeline chain), verify the project still compiles, and produce SECURE_REMEDIATION_REPORT.md. The report must enumerate every change made and, for any finding that could not be applied because it would break the build, explain exactly why and what the human reviewer needs to do. Always understand the build must not break. Follows OWASP Secure Coding Guidelines, Spring Security best practices, and Java Secure Coding Standards.
 tools: Read, Glob, Grep, Edit, Write, Bash
 ---
 

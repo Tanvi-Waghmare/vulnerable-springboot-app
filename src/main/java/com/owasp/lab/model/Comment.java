@@ -29,7 +29,23 @@ public class Comment {
     }
 
     public Long getId() { return id; }
-    public void setId(Long id) { this.id = id; }
+
+    /**
+     * REMEDIATION (VULN-2026-004 / A04:2021 / A08:2021): package-private
+     * setter so Jackson cannot mass-assign the id via {@code @RequestBody}.
+     * JPA still has field access to the {@code @Id} field directly.
+     */
+    void setId(Long id) { this.id = id; }
+
+    /**
+     * REMEDIATION (VULN-2026-006 / A01:2021): the controller can call
+     * this to defensively nullify the id on a freshly-bound entity
+     * before persistence, so a POST can only create a new row and
+     * never overwrite an existing comment.  Public so the controller
+     * package can use it; the package-private {@link #setId} still
+     * prevents Jackson from binding it.
+     */
+    public void clearId() { this.id = null; }
 
     public String getAuthor() { return author; }
     public void setAuthor(String author) { this.author = author; }

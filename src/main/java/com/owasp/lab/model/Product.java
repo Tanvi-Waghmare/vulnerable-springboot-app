@@ -23,7 +23,13 @@ public class Product {
     }
 
     public Long getId() { return id; }
-    public void setId(Long id) { this.id = id; }
+
+    /**
+     * REMEDIATION (VULN-2026-004 / A04:2021 / A08:2021): package-private
+     * setter so Jackson cannot mass-assign the id via {@code @RequestBody}.
+     * JPA still has field access to the {@code @Id} field directly.
+     */
+    void setId(Long id) { this.id = id; }
 
     public String getName() { return name; }
     public void setName(String name) { this.name = name; }

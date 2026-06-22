@@ -1,5 +1,6 @@
 package com.owasp.lab.model;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.persistence.*;
 
 /**
@@ -12,7 +13,10 @@ import jakarta.persistence.*;
  * (BCrypt by default).  Plaintext passwords never reach the database.
  *
  * <p>Never return this field via any public API response.  The
- * {@code AuthController.login} response explicitly omits it.</p>
+ * {@code AuthController.login} response explicitly omits it.
+ * The {@code @JsonProperty(WRITE_ONLY)} annotation ensures it is also
+ * never serialised by Jackson in any other controller response
+ * (VULN-2026-012 / A02:2021 / A01:2021).</p>
  */
 @Entity
 @Table(name = "users")
@@ -27,6 +31,7 @@ public class User {
 
     // VULNERABILITY: storing plaintext password (A02 / A07)
     @Column(nullable = false)
+    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
     private String password;
 
     private String email;
@@ -44,7 +49,15 @@ public class User {
     }
 
     public Long getId() { return id; }
-    public void setId(Long id) { this.id = id; }
+
+    /**
+     * REMEDIATION (VULN-2026-004 / A04:2021 / A08:2021): keep the
+     * setter package-private (Jackson cannot bind a field via a
+     * non-public setter) so an attacker cannot mass-assign {@code id}
+     * via {@code @RequestBody}.  JPA still has field access to the
+     * {@code @Id} field directly and does not need a public setter.
+     */
+    void setId(Long id) { this.id = id; }
 
     public String getUsername() { return username; }
     public void setUsername(String username) { this.username = username; }

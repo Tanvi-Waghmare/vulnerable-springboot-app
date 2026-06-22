@@ -2,6 +2,7 @@ package com.owasp.lab.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
@@ -23,6 +24,7 @@ import org.springframework.security.web.util.matcher.AntPathRequestMatcher;
  *    frames are allowed only on /h2-console/**.
  */
 @Configuration
+@EnableMethodSecurity
 public class SecurityConfig {
 
     @Bean
@@ -34,9 +36,17 @@ public class SecurityConfig {
                 .requestMatchers(
                         new AntPathRequestMatcher("/api/login"),
                         new AntPathRequestMatcher("/api/register"),
-                        new AntPathRequestMatcher("/h2-console/**"),
                         new AntPathRequestMatcher("/error")
                 ).permitAll()
+                // REMEDIATION (VULN-2026-008 / A01:2021 / CWE-306):
+                // /h2-console/** is no longer permitAll.  When the H2
+                // console is enabled via H2_CONSOLE_ENABLED=true the
+                // console path is reachable only by ADMIN so a
+                // misconfigured deployed environment cannot expose an
+                // unauthenticated database console to the network.
+                .requestMatchers(
+                        new AntPathRequestMatcher("/h2-console/**")
+                ).hasRole("ADMIN")
                 .anyRequest().authenticated()
             )
 
@@ -51,29 +61,44 @@ public class SecurityConfig {
             // attack surface for the JSON API.
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
 
-            // REMEDIATION (A05:2021): enable CSRF for session-based
-            // flows.  For STATELESS Basic auth, CSRF is also enforced
-            // and a 403 will be returned if a token is missing.
-            .csrf(csrf -> csrf
-                    .ignoringRequestMatchers(
-                            new AntPathRequestMatcher("/h2-console/**")
-                    )
-            )
+            // REMEDIATION (VULN-2026-001 / A05:2021): this is a non-browser
+            // JSON API that authenticates via HTTP Basic and runs
+            // STATELESS.  There is no ambient authority (no session
+            // cookie, no stored Basic credentials) for an attacker to
+            // ride on, so CSRF is disabled per the Spring Security 6
+            // reference.  Every state-changing request MUST carry its
+            // own credentials.
+            .csrf(csrf -> csrf.disable())
 
-            // REMEDIATION (A05:2021): defence-in-depth response headers.
-            .headers(h -> h
-                    .contentSecurityPolicy(csp -> csp.policyDirectives(
-                            "default-src 'self'; " +
-                            "frame-ancestors 'self'; " +
-                            "script-src 'self'; " +
-                            "object-src 'none'"))
-                    .frameOptions(f -> f.sameOrigin())
-                    .referrerPolicy(r -> r.policy(
-                            org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter
-                                    .ReferrerPolicy.NO_REFERRER))
-                    .httpStrictTransportSecurity(hsts -> hsts
-                            .includeSubDomains(true).maxAgeInSeconds(31536000))
-            );
+            // REMEDIATION (A05:2021 / VULN-2026-010): defence-in-depth
+            // response headers.  Adds CSP, X-Frame-Options, Referrer-Policy,
+            // HSTS, Permissions-Policy, COOP, COEP, CORP.
+            .headers(h -> {
+                h.contentSecurityPolicy(csp -> csp.policyDirectives(
+                        "default-src 'self'; " +
+                        "frame-ancestors 'none'; " +
+                        "base-uri 'none'; " +
+                        "form-action 'self'; " +
+                        "script-src 'self'; " +
+                        "object-src 'none'"));
+                h.frameOptions(f -> f.deny());
+                h.referrerPolicy(r -> r.policy(
+                        org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter
+                                .ReferrerPolicy.NO_REFERRER));
+                h.httpStrictTransportSecurity(hsts -> hsts
+                        .includeSubDomains(true).maxAgeInSeconds(31536000));
+                h.permissionsPolicy(p -> p.policy(
+                        "geolocation=(), camera=(), microphone=()"));
+                h.crossOriginOpenerPolicy(co -> co.policy(
+                        org.springframework.security.web.header.writers.CrossOriginOpenerPolicyHeaderWriter
+                                .CrossOriginOpenerPolicy.SAME_ORIGIN));
+                h.crossOriginEmbedderPolicy(ce -> ce.policy(
+                        org.springframework.security.web.header.writers.CrossOriginEmbedderPolicyHeaderWriter
+                                .CrossOriginEmbedderPolicy.REQUIRE_CORP));
+                h.crossOriginResourcePolicy(cr -> cr.policy(
+                        org.springframework.security.web.header.writers.CrossOriginResourcePolicyHeaderWriter
+                                .CrossOriginResourcePolicy.SAME_ORIGIN));
+            });
 
         return http.build();
     }
