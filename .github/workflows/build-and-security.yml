@@ -446,19 +446,23 @@ jobs:
           git diff --cached --stat | tail -n 20
 
       # -----------------------------------------------------------
-      # 2f. Safe-backup push (no model).
-      #     Computes max-N, picks the parent, builds the branch
-      #     name and commit message locally, validates every hard
-      #     rule, then performs `git push` directly. No NVIDIA call
-      #     in this step — the scan + remediate jobs are the only
-      #     places the model is used.
+      # 2f. NVIDIA push — creates a per-development-branch chain step.
+      #     Branch family: feature/nvidia-git-agent_<N>_<TIMESTAMP>.
+      #     The parent of push #N is the previous push #(N-1)'s tip
+      #     (i.e. the tip of feature/nvidia-git-agent_<MAX_N>_*), or
+      #     the development branch feature/nvidia-git-agent itself if
+      #     no numbered push exists yet.
+      #     The push step itself is model-free — the scan + remediate
+      #     jobs are the only places the model is used.
       # -----------------------------------------------------------
       - name: nvidia-push
         id: nvidia_push
-        # No NVIDIA_API_KEY, no SYSTEM_PROMPT_FILE — the workflow
-        # computes everything itself. The push step can no longer
-        # fail because of a model error, JSON parse failure, or
-        # malformed fenced block.
+        env:
+          # Family prefix for the chain steps created by this workflow.
+          # Change this if the development branch is renamed.
+          CHAIN_PREFIX: feature/nvidia-git-agent
+          # Development branch the chain hangs off (parent of push #1).
+          DEVELOPMENT_BRANCH: feature/nvidia-git-agent
         run: |
           set -euo pipefail
 
@@ -480,14 +484,14 @@ jobs:
             exit 0
           fi
 
-          # ---- Compute max N from remote + local ----
-          REMOTE_REFS=$(git ls-remote --heads origin 'feature/safe-backup_*' 2>/dev/null || true)
-          LOCAL_BRANCHES=$(git branch --list 'feature/safe-backup_*' || true)
+          # ---- Compute max N from remote + local, scoped to the chain family ----
+          REMOTE_REFS=$(git ls-remote --heads origin "${CHAIN_PREFIX}_*" 2>/dev/null || true)
+          LOCAL_BRANCHES=$(git branch --list "${CHAIN_PREFIX}_*" || true)
           MAX_N=0
-          PARENT="feature/safe-backup"
+          PARENT="${DEVELOPMENT_BRANCH}"
           for ref in $REMOTE_REFS $LOCAL_BRANCHES; do
             ref=${ref##*/}            # strip origin/ if present
-            n=$(printf '%s' "$ref" | sed -nE 's/^feature\/safe-backup_([0-9]+)_.*/\1/p')
+            n=$(printf '%s' "$ref" | sed -nE "s/^${CHAIN_PREFIX//\//\\/}_([0-9]+)_.*/\1/p")
             if [ -n "$n" ] && [ "$n" -gt "$MAX_N" ]; then
               MAX_N=$n
               PARENT="$ref"
@@ -501,11 +505,11 @@ jobs:
             echo "::error::Timestamp step failed (contains literal 'time_of_push'). Aborting."
             exit 1
           fi
-          NEW_BRANCH="feature/safe-backup_${NEW_N}_${TS}"
+          NEW_BRANCH="${CHAIN_PREFIX}_${NEW_N}_${TS}"
 
           # ---- Branch-name hard-rule validation (workflow is the source of truth) ----
-          if ! printf '%s' "$NEW_BRANCH" \
-               | grep -qE '^feature/safe-backup_[0-9]+_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$'; then
+          BRANCH_REGEX="^${CHAIN_PREFIX//\//\\/}_[0-9]+_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$"
+          if ! printf '%s' "$NEW_BRANCH" | grep -qE "$BRANCH_REGEX"; then
             echo "::error::Computed branch '$NEW_BRANCH' does not match the required format."
             exit 1
           fi
@@ -523,9 +527,9 @@ jobs:
           BULLETS=$(printf '%s' "$CHANGES_SUMMARY" | tr '|' '\n' | sed 's/^/- /' | paste -sd '\n' -)
 
           # Subject line: keep under 72 chars.
-          SUBJECT="Safety backup push #${NEW_N} — automated remediation"
+          SUBJECT="NVIDIA git-agent push #${NEW_N} — automated remediation"
           if [ "${#SUBJECT}" -gt 72 ]; then
-            SUBJECT="Safety backup push #${NEW_N} — remediation"
+            SUBJECT="NVIDIA git-agent push #${NEW_N} — remediation"
           fi
 
           COMMIT_MSG=$(printf '%s\n\n%s\n\n%s\n%s\n%s\n%s\n\n%s\n' \
@@ -534,16 +538,18 @@ jobs:
             "Build status: Build verified: mvn compile test-compile passed" \
             "Source: SECURITY_ASSESSMENT_REPORT.md + SECURE_REMEDIATION_REPORT.md" \
             "Parent branch: ${PARENT}" \
-            "Manual merge target: main (human review required)" \
+            "Manual merge target: ${DEVELOPMENT_BRANCH} (then main, human review required)" \
             "Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>")
 
-          # ---- Final pre-flight: parent must be valid (we still trust the workflow's
-          #      own computation; the model is no longer in the loop). ----
+          # ---- Final pre-flight ----
           echo "Computed push: branch=${NEW_BRANCH} parent=${PARENT} N=${NEW_N} ts=${TS}"
 
           # Make sure the parent is fetched (in case it's only on the remote).
-          if [ "$PARENT" != "feature/safe-backup" ]; then
+          if [ "$PARENT" != "${DEVELOPMENT_BRANCH}" ]; then
             git fetch origin "$PARENT" 2>/dev/null || true
+          else
+            # First push — make sure the development branch itself is up to date.
+            git fetch origin "${DEVELOPMENT_BRANCH}" 2>/dev/null || true
           fi
 
           git config user.name  "github-actions[bot]"
@@ -587,8 +593,9 @@ jobs:
 
           # Write the push report.
           {
-            echo "# Git Push Report — Safe Backup Push #${NEW_N}"
+            echo "# Git Push Report — NVIDIA git-agent Push #${NEW_N}"
             echo
+            echo "- **Development branch:** \`${DEVELOPMENT_BRANCH}\`"
             echo "- **Parent branch:** \`${PARENT}\`"
             echo "- **Push branch:** \`${NEW_BRANCH}\`"
             echo "- **Push time:** ${TS} (workflow-computed; literal 'time_of_push' is a hard-fail)"
@@ -605,9 +612,10 @@ jobs:
             echo
             echo "- The push branch is named with an incrementing counter so the"
             echo "  developer always knows which push is the latest."
-            echo "- This push is a chain step — its parent is the previous push's"
-            echo "  branch, not \`feature/safe-backup\`. The chain is:"
-            echo "  \`feature/safe-backup\` → ... → \`${PARENT}\` → \`${NEW_BRANCH}\`."
+            echo "- This push is a chain step of the development branch"
+            echo "  \`${DEVELOPMENT_BRANCH}\`; its parent is the previous push's"
+            echo "  tip (or the development branch itself for push #1). The chain is:"
+            echo "  \`${DEVELOPMENT_BRANCH}\` → ... → \`${PARENT}\` → \`${NEW_BRANCH}\`."
             echo "- Run \`git fetch origin\` locally and inspect"
             echo "  \`${NEW_BRANCH}\` before merging."
             echo "- The NVIDIA scan + remediation agents (${NVIDIA_MODEL} via"
@@ -653,9 +661,15 @@ jobs:
             exit 1
           fi
 
-          # Sanity: never push report updates to a chain step or to a
-          # detached HEAD. They must go to a normal named branch.
+          # Sanity: never push report updates to a chain step. The chain
+          # step is always `${CHAIN_PREFIX}_<N>_<TS>` (e.g. feature/nvidia-git-agent_1_…)
+          # — we must not accidentally commit reports there. Reports
+          # belong on the development branch (the trigger).
           case "$TRIGGER_BRANCH" in
+            feature/nvidia-git-agent_[0-9]*_*)
+              echo "::error::Refusing to push report updates to a chain step branch: $TRIGGER_BRANCH"
+              exit 1
+              ;;
             feature/safe-backup_[0-9]*_*)
               echo "::error::Refusing to push report updates to a chain step branch: $TRIGGER_BRANCH"
               exit 1
