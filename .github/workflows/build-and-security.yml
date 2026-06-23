@@ -1,17 +1,15 @@
 name: Build & Security (NVIDIA CI pipeline)
 
-# Trigger on every push to any branch plus manual dispatch.
-# While the pipeline itself is in development (feature/nvidia-git-agent),
-# the workflow should fire on every commit so the chain step is cut
-# from the latest tip. Tighten to [main, master, feature/safe-backup*]
-# once the pipeline stabilises.
+# Trigger only on the development branch while the pipeline is being built.
+# Once the pipeline stabilises, broaden to feature/safe-backup* + master
+# so every chain step is cut from the previous tip.
 on:
   push:
     branches:
-      - '**'
+      - feature/nvidia-git-agent
   pull_request:
     branches:
-      - '**'
+      - feature/nvidia-git-agent
   workflow_dispatch:
 
 # Workflow-wide defaults. Per-job permissions override these.
