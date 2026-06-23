@@ -1,4 +1,4 @@
-name: Build & Security
+name: Build & Security (NVIDIA CI pipeline)
 
 on:
   push:
@@ -7,10 +7,29 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+# Workflow-wide defaults. Per-job permissions override these.
 permissions:
   contents: write
 
+# ---- NVIDIA endpoint configuration ----
+# To use a different model, change NVIDIA_MODEL below. Common
+# build.nvidia.com slugs (any of these will work as long as your
+# NVIDIA_API_KEY has access to them):
+#   meta/llama-3.1-70b-instruct
+#   mistralai/mistral-large-2-instruct
+#   nvidia/nemotron-4-340b-instruct
+# To use a different endpoint (e.g. self-hosted NIM), change
+# NVIDIA_BASE_URL below.
+env:
+  NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1/chat/completions
+  NVIDIA_MODEL: meta/llama-3.1-70b-instruct
+  NVIDIA_TEMPERATURE: "0.0"
+  NVIDIA_MAX_TOKENS: "8192"
+
 jobs:
+  # ---------------------------------------------------------------
+  # 1. Build — unchanged from the previous workflow.
+  # ---------------------------------------------------------------
   build:
     name: Build (Maven)
     runs-on: ubuntu-latest
@@ -38,58 +57,613 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # ---------------------------------------------------------------
+  # 2. Security — three NVIDIA-driven agents + gitleaks.
+  #    Gated on build green.
+  # ---------------------------------------------------------------
   security:
     name: Security
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: write
+    env:
+      # Make the .claude/reports dir exist before any job runs
+      # (the dir is gitignored, the two reports are tracked).
+      REPORTS_DIR: .claude/reports
+      ASSESSMENT_REPORT: .claude/reports/SECURITY_ASSESSMENT_REPORT.md
+      REMEDIATION_REPORT: .claude/reports/SECURE_REMEDIATION_REPORT.md
+      PUSH_REPORT: .claude/reports/GIT_PUSH_REPORT.md
+
     steps:
+      # -----------------------------------------------------------
+      # 2a. Checkout the source so the agents have something to scan.
+      # -----------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- Secret scanning on every push ----
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Ensure reports dir exists
+        run: mkdir -p "$REPORTS_DIR"
+
+      # -----------------------------------------------------------
+      # 2b. Secret scanning — unchanged.
+      # -----------------------------------------------------------
       - name: Gitleaks secret scan
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---- Vulnerability-scanner agent ----
-      # Runs the Claude Code CLI against .claude/agents/vulnerability-scanner.md
-      # and writes SECURITY_ASSESSMENT_REPORT.md at the repo root.
-      # Requires the ANTHROPIC_API_KEY repository secret to be configured.
-      - name: Install Claude Code CLI
+      # -----------------------------------------------------------
+      # 2c. Helper — POST a system + user message to NVIDIA and
+      #     print the assistant's reply to stdout. Defined once, used
+      #     by all three agent jobs. Reads NVIDIA_API_KEY from the
+      #     repo secret.
+      # -----------------------------------------------------------
+      - name: Install curl + jq (already on ubuntu-latest, but be explicit)
         run: |
-          curl -fsSL https://claude.ai/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl jq >/dev/null
+          curl --version | head -n1
+          jq --version
 
-      - name: Run vulnerability-scanner agent
+      # -----------------------------------------------------------
+      # 2d. NVIDIA vulnerability scanner.
+      #     Sends the scanner spec + the repo tree to NVIDIA,
+      #     extracts the fenced ```markdown``` block, writes it to
+      #     .claude/reports/SECURITY_ASSESSMENT_REPORT.md.
+      # -----------------------------------------------------------
+      - name: nvidia-scan
+        id: nvidia_scan
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          SYSTEM_PROMPT_FILE: .claude/agents/nvidia-vulnerability-scanner.md
         run: |
-          claude \
-            --agent vulnerability-scanner \
-            --print \
-            --output-format text \
-            "Run a full security assessment of this repository using .claude/agents/vulnerability-scanner.md. Write SECURITY_ASSESSMENT_REPORT.md at the repo root."
+          set -euo pipefail
+          if [ -z "${NVIDIA_API_KEY:-}" ]; then
+            echo "::error::NVIDIA_API_KEY repository secret is not set."
+            exit 1
+          fi
 
-      - name: Upload vulnerability-scanner report
-        if: always() && hashFiles('SECURITY_ASSESSMENT_REPORT.md') != ''
+          # Build the user message: tree of the repo (capped) +
+          # full body of every Java/config file under 200 KB.
+          USER_PAYLOAD=$(mktemp)
+          {
+            echo "## Repository tree (paths only, capped at 400 entries)"
+            (find . -type f \
+              -not -path './target/*' \
+              -not -path './.git/*' \
+              -not -path './.claude/reports/*' \
+              | sort | head -n 400) || true
+            echo
+            echo "## File contents"
+            while IFS= read -r f; do
+              size=$(wc -c < "$f" 2>/dev/null || echo 0)
+              if [ "$size" -gt 200000 ]; then
+                echo
+                echo "### $f (skipped: ${size} bytes > 200000)"
+                continue
+              fi
+              echo
+              echo "### $f"
+              cat "$f"
+            done < <(find . -type f \
+              \( -name '*.java' -o -name 'pom.xml' -o -name 'application*.yml' \
+                 -o -name 'application*.yaml' -o -name 'application*.properties' \
+                 -o -name '*.html' \) \
+              -not -path './target/*' \
+              -not -path './.git/*' \
+              -not -path './.claude/reports/*' | sort)
+          } > "$USER_PAYLOAD"
+
+          SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
+
+          # Build the JSON request body safely with jq.
+          REQUEST_BODY=$(jq -n \
+            --arg model  "$NVIDIA_MODEL" \
+            --arg sys    "$SYSTEM_PROMPT" \
+            --arg user   "$(cat "$USER_PAYLOAD")" \
+            --argjson temp  "$NVIDIA_TEMPERATURE" \
+            --argjson mtok "$NVIDIA_MAX_TOKENS" \
+            '{model: $model, temperature: $temp, max_tokens: $mtok,
+              messages: [
+                {role: "system", content: $sys},
+                {role: "user",   content: $user}
+              ]}')
+
+          RESPONSE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
+            -H "Authorization: Bearer $NVIDIA_API_KEY" \
+            -H "Content-Type: application/json" \
+            --max-time 600 \
+            -X POST "$NVIDIA_BASE_URL" \
+            -d "$REQUEST_BODY" || echo "000")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::NVIDIA scan HTTP $HTTP_CODE"
+            cat "$RESPONSE_FILE" || true
+            exit 1
+          fi
+
+          # Extract the assistant content.
+          ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
+          if [ -z "$ASSISTANT" ]; then
+            echo "::error::NVIDIA scan returned empty assistant content."
+            cat "$RESPONSE_FILE" || true
+            exit 1
+          fi
+
+          # Extract the first ```markdown ... ``` (or ``` ... ```) block.
+          # Strategy: take content between the first ``` line and the next ``` line.
+          REPORT=$(printf '%s\n' "$ASSISTANT" \
+            | awk '
+                /^```/{ if (!in_block) {in_block=1; next} else {in_block=0; exit} }
+                in_block {print}
+              ')
+
+          if [ -z "$REPORT" ]; then
+            echo "::error::No fenced code block found in NVIDIA scan response."
+            echo "--- raw assistant content (first 4000 chars) ---"
+            printf '%s\n' "$ASSISTANT" | head -c 4000
+            echo
+            echo "--- end ---"
+            exit 1
+          fi
+
+          printf '%s\n' "$REPORT" > "$ASSESSMENT_REPORT"
+          echo "Wrote $ASSESSMENT_REPORT ($(wc -c < "$ASSESSMENT_REPORT") bytes)."
+
+      - name: Upload security assessment report
+        if: always() && hashFiles(env.ASSESSMENT_REPORT) != ''
         uses: actions/upload-artifact@v4
         with:
           name: security-assessment-report
-          path: SECURITY_ASSESSMENT_REPORT.md
+          path: ${{ env.ASSESSMENT_REPORT }}
           retention-days: 90
 
-      # Also publish the report back to the repo so it shows up on the main branch
-      # on the next push trigger (commit only if the file actually changed).
-      - name: Commit report back to branch
-        if: always() && hashFiles('SECURITY_ASSESSMENT_REPORT.md') != ''
+      # -----------------------------------------------------------
+      # 2e. NVIDIA remediation agent.
+      #     Reads the assessment report, asks NVIDIA for a patch
+      #     set + remediation report, applies patches with a small
+      #     awk-driven patcher, runs the build (gate A), reverts on
+      #     failure, writes SECURE_REMEDIATION_REPORT.md.
+      # -----------------------------------------------------------
+      - name: nvidia-remediate
+        id: nvidia_remediate
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          SYSTEM_PROMPT_FILE: .claude/agents/nvidia-remediation-agent.md
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add SECURITY_ASSESSMENT_REPORT.md
-          if git diff --cached --quiet; then
-            echo "No changes to report."
+          set -euo pipefail
+          if [ -z "${NVIDIA_API_KEY:-}" ]; then
+            echo "::error::NVIDIA_API_KEY repository secret is not set."
+            exit 1
+          fi
+          if [ ! -s "$ASSESSMENT_REPORT" ]; then
+            echo "::error::Assessment report missing or empty: $ASSESSMENT_REPORT"
+            exit 1
+          fi
+
+          SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
+
+          # Build the user message = assessment report + referenced files + pom.xml.
+          USER_PAYLOAD=$(mktemp)
+          {
+            echo "## SECURITY_ASSESSMENT_REPORT.md"
+            cat "$ASSESSMENT_REPORT"
+            echo
+            echo "## pom.xml"
+            cat pom.xml
+            echo
+            echo "## Source files referenced by the assessment report"
+            # Pull out repo-relative paths from the report that look like
+            # 'src/main/...' and dump each.
+            grep -oE '`?src/[A-Za-z0-9_./-]+\.java`?' "$ASSESSMENT_REPORT" \
+              | tr -d '`' | sort -u | while IFS= read -r p; do
+                if [ -f "$p" ]; then
+                  echo
+                  echo "### $p"
+                  cat "$p"
+                fi
+              done
+            # Also include the application config files regardless.
+            for f in $(find src/main/resources -type f \
+                       \( -name 'application*.yml' -o -name 'application*.yaml' \
+                          -o -name 'application*.properties' \) 2>/dev/null); do
+              echo
+              echo "### $f"
+              cat "$f"
+            done
+          } > "$USER_PAYLOAD"
+
+          REQUEST_BODY=$(jq -n \
+            --arg model  "$NVIDIA_MODEL" \
+            --arg sys    "$SYSTEM_PROMPT" \
+            --arg user   "$(cat "$USER_PAYLOAD")" \
+            --argjson temp  "$NVIDIA_TEMPERATURE" \
+            --argjson mtok "$NVIDIA_MAX_TOKENS" \
+            '{model: $model, temperature: $temp, max_tokens: $mtok,
+              messages: [
+                {role: "system", content: $sys},
+                {role: "user",   content: $user}
+              ]}')
+
+          RESPONSE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
+            -H "Authorization: Bearer $NVIDIA_API_KEY" \
+            -H "Content-Type: application/json" \
+            --max-time 600 \
+            -X POST "$NVIDIA_BASE_URL" \
+            -d "$REQUEST_BODY" || echo "000")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::NVIDIA remediate HTTP $HTTP_CODE"
+            cat "$RESPONSE_FILE" || true
+            exit 1
+          fi
+
+          ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
+          if [ -z "$ASSISTANT" ]; then
+            echo "::error::NVIDIA remediate returned empty assistant content."
+            cat "$RESPONSE_FILE" || true
+            exit 1
+          fi
+
+          # Block 1: ```nvidia-patches ... ```
+          PATCHES=$(printf '%s\n' "$ASSISTANT" \
+            | awk '
+                /^```nvidia-patches/{ if (!in_block) {in_block=1; next} else {in_block=0; exit} }
+                /^```/{ if (!in_block) next }
+                in_block {print}
+              ')
+
+          # Block 2: ```markdown ... ``` (the second ```markdown block, or the
+          # first ``` ... ``` block if no info string — we just take the last
+          # fenced block with a markdown info string or the last generic block.)
+          REPORT_BODY=$(printf '%s\n' "$ASSISTANT" \
+            | awk '
+                /^```markdown/{ if (!in_block) {in_block=1; next} else {in_block=0; print "<<END>>"; exit} }
+                /^```/{ if (in_block) {in_block=0; print "<<END>>"; next} }
+                in_block {print}
+              ')
+          # If no ```markdown``` block, take the last generic ``` block.
+          if [ -z "$REPORT_BODY" ]; then
+            REPORT_BODY=$(printf '%s\n' "$ASSISTANT" \
+              | awk '
+                  /^```/{ if (!in_block) {in_block=1; next} else {in_block=0; printbuf=1} }
+                  in_block {buf=buf $0 "\n"}
+                  END {if (printbuf) printf "%s", buf}
+                ')
+          fi
+
+          # Always write the remediation report (it documents the run either way).
+          printf '%s\n' "$REPORT_BODY" > "$REMEDIATION_REPORT"
+          echo "Wrote $REMEDIATION_REPORT ($(wc -c < "$REMEDIATION_REPORT") bytes)."
+
+          # Apply patches if any. Patch file format: lines, with `@@@` on its
+          # own line separating path from body, and `@@@` on its own line
+          # between records. We assume path is one line, body is everything
+          # between this `@@@` and the next `@@@`.
+          if [ -n "$PATCHES" ]; then
+            APPLIED=0
+            # Use awk to walk the patch block and emit one
+            # (path)\t(body-to-heredoc) record per file.
+            PATCH_QUEUE=$(mktemp)
+            printf '%s' "$PATCHES" | awk '
+              BEGIN { state = "path"; path = ""; body = ""; }
+              /^@@@$/ {
+                if (state == "body") {
+                  printf "%s\t%s\n", path, body > "'"$PATCH_QUEUE"'"
+                  state = "path"; path = ""; body = ""; next
+                }
+                if (state == "path") { state = "body"; next }
+              }
+              state == "path" { path = (path == "" ? $0 : path "\n" $0) }
+              state == "body" { body = (body == "" ? $0 : body "\n" $0) }
+              END {
+                if (state == "body" && path != "") {
+                  printf "%s\t%s\n", path, body > "'"$PATCH_QUEUE"'"
+                }
+              }
+            '
+            while IFS=$(printf '\t') read -r PFILE PBODY; do
+              [ -z "$PFILE" ] && continue
+              # Security: refuse paths that escape the repo or are absolute.
+              case "$PFILE" in
+                /*|..*|*/../*|*/..) echo "::error::refusing unsafe patch path: $PFILE"; exit 1;;
+              esac
+              mkdir -p "$(dirname "$PFILE")"
+              printf '%s\n' "$PBODY" > "$PFILE"
+              APPLIED=$((APPLIED+1))
+              echo "Patched $PFILE"
+            done < "$PATCH_QUEUE"
+            echo "Applied $APPLIED file(s)."
           else
-            git commit -m "chore(security): refresh SECURITY_ASSESSMENT_REPORT.md"
-            git push
+            echo "No patches emitted by NVIDIA (empty patch block)."
+          fi
+
+      - name: Compile check (gate A)
+        id: gate_a
+        # Use `continue-on-error` so the next step can detect failure and revert.
+        continue-on-error: true
+        run: mvn -B -q compile test-compile
+
+      - name: Revert on build failure
+        if: steps.gate_a.outcome != 'success'
+        run: |
+          echo "::error::Build did not pass after NVIDIA patches — reverting."
+          git checkout -- .
+          # Force the remediation report to record the failure.
+          if [ -f "$REMEDIATION_REPORT" ]; then
+            {
+              echo
+              echo
+              echo "> **Build verified: failed — all edits reverted** (workflow forced this line after `mvn -B -q compile test-compile` exited non-zero)."
+            } >> "$REMEDIATION_REPORT"
+          fi
+
+      - name: Finalize build status in remediation report
+        if: steps.gate_a.outcome == 'success'
+        run: |
+          if [ -f "$REMEDIATION_REPORT" ] \
+             && ! grep -q '^Build verified:' "$REMEDIATION_REPORT"; then
+            {
+              echo
+              echo
+              echo "> **Build verified: mvn compile test-compile passed** (recorded by the workflow after the agent emitted an empty patch set, or after patches applied cleanly)."
+            } >> "$REMEDIATION_REPORT"
+          fi
+
+      - name: Upload secure remediation report
+        if: always() && hashFiles(env.REMEDIATION_REPORT) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-remediation-report
+          path: ${{ env.REMEDIATION_REPORT }}
+          retention-days: 90
+
+      - name: Stage remediation working-tree changes
+        # Always stage — git-agent will decide whether there is something to push.
+        run: |
+          set -euo pipefail
+          git add -A
+          # Force-add the two tracked reports (their dir is otherwise ignored).
+          git add -f "$ASSESSMENT_REPORT" "$REMEDIATION_REPORT" 2>/dev/null || true
+          git status --short
+          echo "---"
+          git diff --cached --stat | tail -n 20
+
+      # -----------------------------------------------------------
+      # 2f. Safe-backup push (no model).
+      #     Computes max-N, picks the parent, builds the branch
+      #     name and commit message locally, validates every hard
+      #     rule, then performs `git push` directly. No NVIDIA call
+      #     in this step — the scan + remediate jobs are the only
+      #     places the model is used.
+      # -----------------------------------------------------------
+      - name: nvidia-push
+        id: nvidia_push
+        # No NVIDIA_API_KEY, no SYSTEM_PROMPT_FILE — the workflow
+        # computes everything itself. The push step can no longer
+        # fail because of a model error, JSON parse failure, or
+        # malformed fenced block.
+        run: |
+          set -euo pipefail
+
+          # ---- Pre-flight: gate A must be green ----
+          if [ "${{ steps.gate_a.outcome }}" != "success" ]; then
+            echo "::error::Gate A failed (build not green). Aborting push per pipeline gates."
+            exit 1
+          fi
+          if [ ! -s "$REMEDIATION_REPORT" ] \
+             || ! grep -q 'Build verified: mvn compile test-compile passed' "$REMEDIATION_REPORT"; then
+            echo "::error::Gate B failed: remediation report missing the build-passed sentinel."
+            exit 1
+          fi
+
+          # ---- Pre-flight: something to commit ----
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Nothing to commit. Skipping push."
+            echo "skipped" > "$PUSH_REPORT"
+            exit 0
+          fi
+
+          # ---- Compute max N from remote + local ----
+          REMOTE_REFS=$(git ls-remote --heads origin 'feature/safe-backup_*' 2>/dev/null || true)
+          LOCAL_BRANCHES=$(git branch --list 'feature/safe-backup_*' || true)
+          MAX_N=0
+          PARENT="feature/safe-backup"
+          for ref in $REMOTE_REFS $LOCAL_BRANCHES; do
+            ref=${ref##*/}            # strip origin/ if present
+            n=$(printf '%s' "$ref" | sed -nE 's/^feature\/safe-backup_([0-9]+)_.*/\1/p')
+            if [ -n "$n" ] && [ "$n" -gt "$MAX_N" ]; then
+              MAX_N=$n
+              PARENT="$ref"
+            fi
+          done
+          NEW_N=$((MAX_N + 1))
+
+          # ---- Workflow-supplied timestamp (source of truth) ----
+          TS=$(date +%Y-%m-%d_%H-%M-%S)
+          if [ -z "$TS" ] || printf '%s' "$TS" | grep -q 'time_of_push'; then
+            echo "::error::Timestamp step failed (contains literal 'time_of_push'). Aborting."
+            exit 1
+          fi
+          NEW_BRANCH="feature/safe-backup_${NEW_N}_${TS}"
+
+          # ---- Branch-name hard-rule validation (workflow is the source of truth) ----
+          if ! printf '%s' "$NEW_BRANCH" \
+               | grep -qE '^feature/safe-backup_[0-9]+_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$'; then
+            echo "::error::Computed branch '$NEW_BRANCH' does not match the required format."
+            exit 1
+          fi
+
+          # ---- Build the commit message locally from the remediation report ----
+          # Pull up to 8 bullet lines out of "# Changes Made" to use as the body.
+          CHANGES_SUMMARY=$(awk '/^# Changes Made/{flag=1; next} /^# /{flag=0} flag && NF{print}' "$REMEDIATION_REPORT" \
+                            | sed -nE 's/^[[:space:]]*[-*][[:space:]]*//p' \
+                            | head -n 8 \
+                            | sed 's/[\"]/\\&/g' \
+                            | paste -sd '|' -)
+          if [ -z "$CHANGES_SUMMARY" ]; then
+            CHANGES_SUMMARY="automated remediation"
+          fi
+          BULLETS=$(printf '%s' "$CHANGES_SUMMARY" | tr '|' '\n' | sed 's/^/- /' | paste -sd '\n' -)
+
+          # Subject line: keep under 72 chars.
+          SUBJECT="Safety backup push #${NEW_N} — automated remediation"
+          if [ "${#SUBJECT}" -gt 72 ]; then
+            SUBJECT="Safety backup push #${NEW_N} — remediation"
+          fi
+
+          COMMIT_MSG=$(printf '%s\n\n%s\n\n%s\n%s\n%s\n%s\n\n%s\n' \
+            "$SUBJECT" \
+            "$BULLETS" \
+            "Build status: Build verified: mvn compile test-compile passed" \
+            "Source: SECURITY_ASSESSMENT_REPORT.md + SECURE_REMEDIATION_REPORT.md" \
+            "Parent branch: ${PARENT}" \
+            "Manual merge target: main (human review required)" \
+            "Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>")
+
+          # ---- Final pre-flight: parent must be valid (we still trust the workflow's
+          #      own computation; the model is no longer in the loop). ----
+          echo "Computed push: branch=${NEW_BRANCH} parent=${PARENT} N=${NEW_N} ts=${TS}"
+
+          # Make sure the parent is fetched (in case it's only on the remote).
+          if [ "$PARENT" != "feature/safe-backup" ]; then
+            git fetch origin "$PARENT" 2>/dev/null || true
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout "$PARENT"
+          git checkout -b "$NEW_BRANCH"
+
+          # Re-stage on the new branch (working tree carries over, but be safe).
+          git add -A
+          git add -f "$ASSESSMENT_REPORT" "$REMEDIATION_REPORT" 2>/dev/null || true
+
+          # Local compile-check on the new branch (catches line-ending drift).
+          if ! mvn -B -q compile test-compile; then
+            echo "::error::Local compile-check on new branch failed. Aborting push."
+            git checkout "$PARENT"
+            git branch -D "$NEW_BRANCH"
+            exit 1
+          fi
+
+          # Commit (use a temp file for the message to preserve newlines exactly).
+          MSG_FILE=$(mktemp)
+          printf '%s' "$COMMIT_MSG" > "$MSG_FILE"
+          git commit -F "$MSG_FILE"
+
+          PUSH_OUT=$(git push -u origin "$NEW_BRANCH" 2>&1)
+          PUSH_RC=$?
+          if [ "$PUSH_RC" -ne 0 ]; then
+            echo "::error::git push failed (rc=$PUSH_RC):"
+            echo "$PUSH_OUT"
+            git checkout "$PARENT"
+            git branch -D "$NEW_BRANCH"
+            exit 1
+          fi
+
+          COMMIT_SHA=$(git rev-parse HEAD)
+          REMOTE_URL=$(git remote get-url origin)
+
+          # Switch back to the parent so the runner is in a clean state.
+          git checkout "$PARENT"
+
+          # Write the push report.
+          {
+            echo "# Git Push Report — Safe Backup Push #${NEW_N}"
+            echo
+            echo "- **Parent branch:** \`${PARENT}\`"
+            echo "- **Push branch:** \`${NEW_BRANCH}\`"
+            echo "- **Push time:** ${TS} (workflow-computed; literal 'time_of_push' is a hard-fail)"
+            echo "- **Remote:** origin (${REMOTE_URL})"
+            echo "- **Commit:** ${COMMIT_SHA}"
+            echo "- **Build verified:** yes (mvn compile test-compile passed before push, on the new branch)"
+            echo "- **Chain step decision:** workflow-computed (no model in the push step)"
+            echo
+            echo "## Files Pushed"
+            echo
+            git show --stat --name-only --format="" "$COMMIT_SHA" | sed 's/^/- /'
+            echo
+            echo "## Notes"
+            echo
+            echo "- The push branch is named with an incrementing counter so the"
+            echo "  developer always knows which push is the latest."
+            echo "- This push is a chain step — its parent is the previous push's"
+            echo "  branch, not \`feature/safe-backup\`. The chain is:"
+            echo "  \`feature/safe-backup\` → ... → \`${PARENT}\` → \`${NEW_BRANCH}\`."
+            echo "- Run \`git fetch origin\` locally and inspect"
+            echo "  \`${NEW_BRANCH}\` before merging."
+            echo "- The NVIDIA scan + remediation agents (${NVIDIA_MODEL} via"
+            echo "  ${NVIDIA_BASE_URL}) decided which source files to fix and"
+            echo "  what the secure replacements were; the workflow validated"
+            echo "  every patch against \`mvn -B -q compile test-compile\` and"
+            echo "  computed the chain step itself."
+          } > "$PUSH_REPORT"
+
+          echo "Pushed: $NEW_BRANCH @ $COMMIT_SHA"
+          echo "branch=${NEW_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT_SHA}"   >> "$GITHUB_OUTPUT"
+
+      - name: Upload git push report
+        if: always() && hashFiles(env.PUSH_REPORT) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-push-report
+          path: ${{ env.PUSH_REPORT }}
+          retention-days: 90
+
+      # -----------------------------------------------------------
+      # 2g. Commit the two tracked reports back to the original
+      #     trigger branch (the branch the workflow was launched
+      #     from), not to the parent chain step we just created.
+      #     The chain step itself was already pushed in 2f.
+      #     We switch to ${GITHUB_REF_NAME} (the trigger branch)
+      #     so the reports land where the developer is looking.
+      # -----------------------------------------------------------
+      - name: Commit reports back to trigger branch
+        if: always() && hashFiles(env.ASSESSMENT_REPORT, env.REMEDIATION_REPORT) != ''
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Recover the original trigger branch. After nvidia-push the
+          # runner is checked out on the parent chain step, so we have
+          # to switch back to the branch the workflow was launched from.
+          TRIGGER_BRANCH="${GITHUB_REF_NAME}"
+          if [ -z "$TRIGGER_BRANCH" ] || [ "$TRIGGER_BRANCH" = "null" ]; then
+            echo "::error::GITHUB_REF_NAME is empty — cannot determine trigger branch."
+            exit 1
+          fi
+
+          # Sanity: never push report updates to a chain step or to a
+          # detached HEAD. They must go to a normal named branch.
+          case "$TRIGGER_BRANCH" in
+            feature/safe-backup_[0-9]*_*)
+              echo "::error::Refusing to push report updates to a chain step branch: $TRIGGER_BRANCH"
+              exit 1
+              ;;
+          esac
+
+          git fetch origin "$TRIGGER_BRANCH" 2>/dev/null || true
+          git checkout "$TRIGGER_BRANCH"
+
+          git add -f "$ASSESSMENT_REPORT" "$REMEDIATION_REPORT"
+          if git diff --cached --quiet; then
+            echo "No report changes to commit on $TRIGGER_BRANCH."
+          else
+            git commit -m "chore(security): refresh SECURITY_ASSESSMENT_REPORT.md + SECURE_REMEDIATION_REPORT.md [skip ci]"
+            git push origin "$TRIGGER_BRANCH"
           fi
