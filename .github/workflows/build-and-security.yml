@@ -288,6 +288,20 @@ jobs:
             done
           } > "$USER_PAYLOAD"
 
+          echo "=================================="
+          echo "ASSESSMENT REPORT SIZE"
+          wc -c "$ASSESSMENT_REPORT"
+
+          echo "=================================="
+          echo "PROMPT SIZE"
+          wc -c "$USER_PAYLOAD"
+
+          echo "=================================="
+          echo "FIRST 20 LINES OF PAYLOAD"
+          head -20 "$USER_PAYLOAD"
+
+          echo "=================================="
+
           REQUEST_BODY=$(jq -n \
             --arg model  "$NVIDIA_MODEL" \
             --arg sys    "$SYSTEM_PROMPT" \
